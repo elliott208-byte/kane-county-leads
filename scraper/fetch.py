@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Kane County, Illinois – Motivated Seller Lead Scraper
-Targets: Recorder of Deeds document search (Clerk portal)
-Parcel data: Kane County GIS / Township Assessors bulk DBF
+Targets: Kane County Recorder of Deeds / Circuit Clerk document search
+Parcel data: Kane County GIS open data bulk download
 Look-back: 7 days   |   Output: dashboard/records.json + data/records.json
 """
 
@@ -10,12 +10,10 @@ import asyncio
 import csv
 import json
 import logging
-import os
 import re
 import sys
 import time
 import traceback
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -36,47 +34,64 @@ logging.basicConfig(
 log = logging.getLogger("kane_leads")
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants  – update if Kane County changes their portal URL
 # ---------------------------------------------------------------------------
-CLERK_BASE = "https://recorder.kanecountyil.gov"
-CLERK_SEARCH = f"{CLERK_BASE}/PT_Web_Search/PT_Web_Search.aspx"
-# Kane County GIS Open Data – parcel shapefile / DBF download
-PARCEL_DBF_URL = (
-    "https://opendata.arcgis.com/datasets/"
-    "5d39b7b4e2224955913cce5a8d8fc59b_0.zip"
-)
-# Fallback / alternative sources
-PARCEL_ALT_URLS = [
-    "https://gis.kanecountyil.gov/arcgis/rest/services/Parcel/MapServer/0/query"
-    "?where=1%3D1&outFields=PIN%2COWNER%2CSITEADDR%2CSITE_CITY%2CSITE_ZIP%2CMAILADR1%2CMAILCITY%2CSTATE%2CMAILZIP"
-    "&f=json&resultRecordCount=100000",
+# Primary: Kane County Recorder of Deeds public search
+CLERK_BASE   = "https://kanecountyrecorder.com"
+CLERK_SEARCH = f"{CLERK_BASE}/SearchDocuments.aspx"
+
+# Alternate portals to try if primary fails
+CLERK_ALTERNATES = [
+    "https://www.kanecountyrecorder.com/SearchDocuments.aspx",
+    "https://kanecounty.devnetwedge.com",        # iDocMarket / Devnet style
+    "https://recordings.kanecountyil.gov",
+]
+
+# Kane County GIS Open Data – Parcel layer
+# Try multiple known endpoints; the scraper is resilient if all fail
+PARCEL_URLS = [
+    # ArcGIS Hub open data (search: kane county il parcels)
+    "https://opendata.arcgis.com/datasets/a8ee7d36dbde47f5acb3ddc5f29b2396_0.zip",
+    # Kane County GIS REST (may need authentication in prod)
+    (
+        "https://gis.kanecountyil.gov/arcgis/rest/services/PropertyInfo/"
+        "MapServer/0/query"
+        "?where=1%3D1&outFields=OWNER%2CSITEADDR%2CSITECITY%2CSITEZIP"
+        "%2CMAILADDR%2CMAILCITY%2CMAILSTATE%2CMAILZIP"
+        "&f=json&resultRecordCount=50000"
+    ),
+    # Illinois GIS open data (statewide parcel dataset)
+    (
+        "https://opendata.illinois.gov/resource/kqbd-tnbf.json"
+        "?county=Kane&$limit=50000"
+    ),
 ]
 
 LOOK_BACK_DAYS = 7
 RETRY_ATTEMPTS = 3
-RETRY_DELAY = 5  # seconds
+RETRY_DELAY    = 5  # seconds
 
+# ---------------------------------------------------------------------------
 # Document type mappings
+# ---------------------------------------------------------------------------
 DOC_TYPE_MAP = {
-    # code -> (category, label, base score flags)
-    "LP":      ("foreclosure",  "Lis Pendens",               ["Lis pendens", "Pre-foreclosure"]),
-    "NOFC":    ("foreclosure",  "Notice of Foreclosure",      ["Pre-foreclosure"]),
-    "TAXDEED": ("tax",          "Tax Deed",                   ["Tax lien"]),
-    "JUD":     ("judgment",     "Judgment",                   ["Judgment lien"]),
-    "CCJ":     ("judgment",     "Certified Judgment",         ["Judgment lien"]),
-    "DRJUD":   ("judgment",     "Domestic Judgment",          ["Judgment lien"]),
-    "LNCORPTX":("lien",         "Corp Tax Lien",              ["Tax lien", "LLC / corp owner"]),
-    "LNIRS":   ("lien",         "IRS Lien",                   ["Tax lien"]),
-    "LNFED":   ("lien",         "Federal Lien",               ["Tax lien"]),
-    "LN":      ("lien",         "Lien",                       ["Mechanic lien"]),
-    "LNMECH":  ("lien",         "Mechanic Lien",              ["Mechanic lien"]),
-    "LNHOA":   ("lien",         "HOA Lien",                   ["Mechanic lien"]),
-    "MEDLN":   ("lien",         "Medicaid Lien",              []),
-    "PRO":     ("probate",      "Probate Document",           ["Probate / estate"]),
-    "NOC":     ("construction", "Notice of Commencement",     []),
-    "RELLP":   ("release",      "Release Lis Pendens",        []),
+    "LP":       ("foreclosure",  "Lis Pendens",              ["Lis pendens", "Pre-foreclosure"]),
+    "NOFC":     ("foreclosure",  "Notice of Foreclosure",    ["Pre-foreclosure"]),
+    "TAXDEED":  ("tax",          "Tax Deed",                 ["Tax lien"]),
+    "JUD":      ("judgment",     "Judgment",                 ["Judgment lien"]),
+    "CCJ":      ("judgment",     "Certified Judgment",       ["Judgment lien"]),
+    "DRJUD":    ("judgment",     "Domestic Judgment",        ["Judgment lien"]),
+    "LNCORPTX": ("lien",         "Corp Tax Lien",            ["Tax lien", "LLC / corp owner"]),
+    "LNIRS":    ("lien",         "IRS Lien",                 ["Tax lien"]),
+    "LNFED":    ("lien",         "Federal Lien",             ["Tax lien"]),
+    "LN":       ("lien",         "Lien",                     ["Mechanic lien"]),
+    "LNMECH":   ("lien",         "Mechanic Lien",            ["Mechanic lien"]),
+    "LNHOA":    ("lien",         "HOA Lien",                 ["Mechanic lien"]),
+    "MEDLN":    ("lien",         "Medicaid Lien",            []),
+    "PRO":      ("probate",      "Probate Document",         ["Probate / estate"]),
+    "NOC":      ("construction", "Notice of Commencement",   []),
+    "RELLP":    ("release",      "Release Lis Pendens",      []),
 }
-
 ALL_DOC_CODES = list(DOC_TYPE_MAP.keys())
 
 # ---------------------------------------------------------------------------
@@ -84,7 +99,6 @@ ALL_DOC_CODES = list(DOC_TYPE_MAP.keys())
 # ---------------------------------------------------------------------------
 
 def retry(fn, attempts=RETRY_ATTEMPTS, delay=RETRY_DELAY):
-    """Call fn(); on exception wait and retry up to `attempts` times."""
     for i in range(attempts):
         try:
             return fn()
@@ -96,12 +110,10 @@ def retry(fn, attempts=RETRY_ATTEMPTS, delay=RETRY_DELAY):
 
 
 def safe_text(el) -> str:
-    """Return stripped text from a BS4 element, or ''."""
     return el.get_text(strip=True) if el else ""
 
 
 def parse_amount(raw: str) -> float:
-    """Convert '$1,234.56' or '1234.56' to float."""
     cleaned = re.sub(r"[^\d.]", "", raw or "")
     try:
         return float(cleaned)
@@ -114,10 +126,8 @@ def normalize_name(name: str) -> str:
 
 
 def make_name_variants(name: str) -> List[str]:
-    """Return ['FIRST LAST', 'LAST FIRST', 'LAST, FIRST'] variants."""
     n = normalize_name(name)
     variants = {n}
-    # if comma separated: 'SMITH, JOHN'
     if "," in n:
         parts = [p.strip() for p in n.split(",", 1)]
         if len(parts) == 2:
@@ -139,92 +149,74 @@ def make_name_variants(name: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 class ParcelLookup:
-    """
-    Loads parcel data from Kane County GIS and builds an owner-name index.
-    Supports both DBF (zipped shapefile) and JSON (ArcGIS REST) sources.
-    """
-
     def __init__(self):
         self._by_owner: Dict[str, List[Dict]] = {}
         self._loaded = False
 
-    # ------------------------------------------------------------------
     def load(self):
         if self._loaded:
             return
         log.info("Loading parcel data …")
         loaded = False
-        # Try DBF via zip download
-        try:
-            self._load_dbf()
-            loaded = True
-        except Exception as exc:
-            log.warning("DBF load failed: %s", exc)
-        # Fallback: ArcGIS REST JSON
-        if not loaded:
+
+        for url in PARCEL_URLS:
             try:
-                self._load_arcgis_json()
+                if url.endswith(".zip"):
+                    self._load_dbf_zip(url)
+                elif "f=json" in url or ".json" in url:
+                    self._load_json(url)
+                else:
+                    self._load_dbf_zip(url)
                 loaded = True
+                break
             except Exception as exc:
-                log.warning("ArcGIS JSON load failed: %s", exc)
+                log.warning("Parcel source failed (%s): %s", url[:60], exc)
+
         if loaded:
             log.info("Parcel index built: %d unique owner keys", len(self._by_owner))
         else:
             log.warning("No parcel data loaded – address enrichment disabled")
         self._loaded = True
 
-    # ------------------------------------------------------------------
-    def _load_dbf(self):
-        """Download zipped shapefile, extract .dbf, parse with dbfread."""
+    def _load_dbf_zip(self, url: str):
         from dbfread import DBF
-
         def fetch_zip():
-            r = requests.get(PARCEL_DBF_URL, timeout=60)
+            r = requests.get(url, timeout=90)
             r.raise_for_status()
             return r.content
-
         content = retry(fetch_zip)
         with ZipFile(BytesIO(content)) as zf:
-            dbf_name = next(
-                (n for n in zf.namelist() if n.lower().endswith(".dbf")), None
-            )
+            dbf_name = next((n for n in zf.namelist() if n.lower().endswith(".dbf")), None)
             if not dbf_name:
                 raise FileNotFoundError("No .dbf in zip")
             log.info("Parsing DBF: %s", dbf_name)
-            with zf.open(dbf_name) as f:
-                raw = f.read()
-        # dbfread needs a file path or file-like – write to tmp
+            raw = zf.read(dbf_name)
         tmp = Path("/tmp/_parcels.dbf")
         tmp.write_bytes(raw)
         for rec in DBF(str(tmp), lowernames=True, ignore_missing_memofile=True):
             self._ingest_record(rec)
 
-    # ------------------------------------------------------------------
-    def _load_arcgis_json(self):
-        """Load parcel data from ArcGIS REST feature service."""
-        for url in PARCEL_ALT_URLS:
-            try:
-                def fetch_json():
-                    r = requests.get(url, timeout=60)
-                    r.raise_for_status()
-                    return r.json()
+    def _load_json(self, url: str):
+        def fetch_json():
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        data = retry(fetch_json)
+        # ArcGIS REST format
+        features = data.get("features") if isinstance(data, dict) else None
+        if features is not None:
+            for feat in features:
+                attrs = {k.lower(): v for k, v in feat.get("attributes", {}).items()}
+                self._ingest_record(attrs)
+        elif isinstance(data, list):
+            # Socrata / CKAN flat JSON
+            for rec in data:
+                norm = {k.lower(): v for k, v in rec.items()}
+                self._ingest_record(norm)
+        else:
+            raise ValueError("Unrecognised JSON structure")
+        log.info("Loaded %d parcel records from JSON", len(self._by_owner))
 
-                data = retry(fetch_json)
-                features = data.get("features", [])
-                if not features:
-                    continue
-                for feat in features:
-                    attrs = feat.get("attributes", {})
-                    # normalise keys to lowercase
-                    rec = {k.lower(): v for k, v in attrs.items()}
-                    self._ingest_record(rec)
-                log.info("Loaded %d parcels from ArcGIS REST", len(features))
-                return
-            except Exception as e:
-                log.warning("ArcGIS URL failed: %s – %s", url, e)
-        raise RuntimeError("All ArcGIS sources failed")
-
-    # ------------------------------------------------------------------
     def _col(self, rec: dict, *candidates) -> str:
         for c in candidates:
             v = rec.get(c) or rec.get(c.upper()) or rec.get(c.lower())
@@ -233,25 +225,23 @@ class ParcelLookup:
         return ""
 
     def _ingest_record(self, rec: dict):
-        owner = self._col(rec, "owner", "own1", "ownername")
+        owner = self._col(rec, "owner", "own1", "ownername", "owner_name")
         if not owner:
             return
         entry = {
             "owner_raw": owner,
-            "site_addr": self._col(rec, "site_addr", "siteaddr", "address"),
-            "site_city": self._col(rec, "site_city", "city"),
-            "site_zip":  self._col(rec, "site_zip",  "zip"),
-            "mail_addr": self._col(rec, "addr_1", "mailadr1", "mail_addr"),
-            "mail_city": self._col(rec, "city",   "mailcity"),
-            "mail_state":self._col(rec, "state",  "mailstate"),
-            "mail_zip":  self._col(rec, "zip",    "mailzip"),
+            "site_addr": self._col(rec, "site_addr", "siteaddr", "address", "siteaddress"),
+            "site_city": self._col(rec, "site_city", "sitecity", "city"),
+            "site_zip":  self._col(rec, "site_zip",  "sitezip",  "zip"),
+            "mail_addr": self._col(rec, "addr_1", "mailadr1", "mail_addr", "mailaddr"),
+            "mail_city": self._col(rec, "city",   "mailcity", "mail_city"),
+            "mail_state":self._col(rec, "state",  "mailstate","mail_state"),
+            "mail_zip":  self._col(rec, "zip",    "mailzip",  "mail_zip"),
         }
         for variant in make_name_variants(owner):
             self._by_owner.setdefault(variant, []).append(entry)
 
-    # ------------------------------------------------------------------
     def lookup(self, owner_name: str) -> Optional[Dict]:
-        """Return best-match parcel record for owner_name, or None."""
         if not owner_name:
             return None
         for variant in make_name_variants(owner_name):
@@ -262,7 +252,7 @@ class ParcelLookup:
 
 
 # ---------------------------------------------------------------------------
-# Clerk Portal Scraper (Playwright async)
+# Recorder Portal Scraper  (Playwright async)
 # ---------------------------------------------------------------------------
 
 async def scrape_clerk_playwright(
@@ -270,16 +260,15 @@ async def scrape_clerk_playwright(
     start_date: datetime,
     end_date: datetime,
 ) -> List[Dict]:
-    """
-    Use Playwright to search Kane County Recorder search portal
-    for each document type in the date range.
-    Returns list of raw record dicts.
-    """
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
     records: List[Dict] = []
     date_from = start_date.strftime("%m/%d/%Y")
     date_to   = end_date.strftime("%m/%d/%Y")
+
+    # Try each known portal URL until one works
+    working_url = None
+    search_urls = [CLERK_SEARCH] + CLERK_ALTERNATES
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -292,10 +281,25 @@ async def scrape_clerk_playwright(
         )
         page = await context.new_page()
 
+        # Probe for working URL
+        for url in search_urls:
+            try:
+                await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+                working_url = url
+                log.info("Clerk portal found at: %s", url)
+                break
+            except Exception:
+                log.warning("Portal not reachable: %s", url)
+
+        if not working_url:
+            log.error("No clerk portal URL is reachable; skipping Playwright scrape")
+            await browser.close()
+            return []
+
         for doc_code in doc_codes:
             try:
                 recs = await _scrape_doc_type(
-                    page, doc_code, date_from, date_to
+                    page, doc_code, date_from, date_to, working_url
                 )
                 log.info("  %s → %d records", doc_code, len(recs))
                 records.extend(recs)
@@ -308,44 +312,59 @@ async def scrape_clerk_playwright(
 
 
 async def _scrape_doc_type(
-    page, doc_code: str, date_from: str, date_to: str
+    page, doc_code: str, date_from: str, date_to: str, base_url: str
 ) -> List[Dict]:
-    """Navigate the recorder search form for one document type."""
     from playwright.async_api import TimeoutError as PWTimeout
 
     records: List[Dict] = []
 
     for attempt in range(RETRY_ATTEMPTS):
         try:
-            await page.goto(CLERK_SEARCH, timeout=30000, wait_until="networkidle")
+            await page.goto(base_url, timeout=30000, wait_until="networkidle")
             await asyncio.sleep(1)
-            # Fill search form – selectors observed on the Kane County Recorder portal
-            # Document type dropdown
-            try:
-                await page.select_option('select[name*="DocType"], select[id*="DocType"]', label=doc_code, timeout=5000)
-            except Exception:
-                try:
-                    await page.select_option('select[name*="DocType"], select[id*="DocType"]', value=doc_code, timeout=5000)
-                except Exception:
-                    # Try text search in the dropdown options
-                    pass
 
-            # Date range
-            for sel in ['input[name*="DateFrom"], input[id*="DateFrom"]']:
+            # Try multiple selector patterns for document type
+            for sel in [
+                'select[name*="DocType"]', 'select[id*="DocType"]',
+                'select[name*="doctype"]', 'select[id*="Type"]',
+                '#ctl00_ContentPlaceHolder1_ddlDocType',
+            ]:
                 try:
-                    await page.fill(sel, date_from, timeout=5000)
+                    await page.select_option(sel, label=doc_code, timeout=3000)
+                    break
+                except Exception:
+                    try:
+                        await page.select_option(sel, value=doc_code, timeout=3000)
+                        break
+                    except Exception:
+                        pass
+
+            # Date range selectors
+            for sel in ['input[name*="DateFrom"]', 'input[id*="DateFrom"]',
+                        '#ctl00_ContentPlaceHolder1_txtDateFrom']:
+                try:
+                    await page.fill(sel, date_from, timeout=3000)
                     break
                 except Exception:
                     pass
-            for sel in ['input[name*="DateTo"], input[id*="DateTo"]']:
+
+            for sel in ['input[name*="DateTo"]', 'input[id*="DateTo"]',
+                        '#ctl00_ContentPlaceHolder1_txtDateTo']:
                 try:
-                    await page.fill(sel, date_to, timeout=5000)
+                    await page.fill(sel, date_to, timeout=3000)
                     break
                 except Exception:
                     pass
 
             # Submit
-            await page.click('input[type="submit"], button[type="submit"]', timeout=10000)
+            for sel in ['input[type="submit"]', 'button[type="submit"]',
+                        'input[value*="Search"]', '#ctl00_ContentPlaceHolder1_btnSearch']:
+                try:
+                    await page.click(sel, timeout=5000)
+                    break
+                except Exception:
+                    pass
+
             await page.wait_for_load_state("networkidle", timeout=30000)
             break
         except PWTimeout:
@@ -353,27 +372,24 @@ async def _scrape_doc_type(
                 raise
             await asyncio.sleep(RETRY_DELAY)
 
-    # Parse results
     html = await page.content()
     records = _parse_search_results(html, doc_code)
 
-    # Handle pagination
-    page_num = 2
+    # Pagination
     while True:
         try:
             next_btn = await page.query_selector(
-                'a:has-text("Next"), input[value="Next >"], a[id*="Next"]'
+                'a:has-text("Next"), input[value*="Next"], a[id*="Next"], '
+                'a:has-text(">"), input[value=">"]'
             )
             if not next_btn:
                 break
             await next_btn.click()
             await page.wait_for_load_state("networkidle", timeout=20000)
-            html = await page.content()
-            new_recs = _parse_search_results(html, doc_code)
+            new_recs = _parse_search_results(await page.content(), doc_code)
             if not new_recs:
                 break
             records.extend(new_recs)
-            page_num += 1
         except Exception:
             break
 
@@ -381,21 +397,18 @@ async def _scrape_doc_type(
 
 
 def _parse_search_results(html: str, doc_code: str) -> List[Dict]:
-    """Parse HTML results table from the clerk portal."""
     soup = BeautifulSoup(html, "lxml")
     records: List[Dict] = []
 
-    # Look for results in a table (common pattern for these portals)
     tables = soup.find_all("table")
     for table in tables:
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
-        # Detect header row
         headers = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th", "td"])]
-        if not any(h in headers for h in ["doc", "document", "grantor", "date", "book"]):
+        if not any(h in headers for h in ["doc", "document", "grantor", "date", "book", "recorded"]):
             continue
-        # Map header positions
+
         col = {h: i for i, h in enumerate(headers)}
 
         def gcol(row_cells, *names) -> str:
@@ -410,13 +423,12 @@ def _parse_search_results(html: str, doc_code: str) -> List[Dict]:
             if len(cells) < 3:
                 continue
             try:
-                doc_num  = gcol(cells, "doc", "document number", "instrument")
+                doc_num  = gcol(cells, "doc", "document", "instrument", "number")
                 filed    = gcol(cells, "date", "recorded", "filed")
                 grantor  = gcol(cells, "grantor", "owner", "name")
                 grantee  = gcol(cells, "grantee", "party")
                 legal    = gcol(cells, "legal", "description")
                 amount   = gcol(cells, "amount", "consideration", "value")
-                # Build direct URL
                 link_el  = row.find("a", href=True)
                 href     = link_el["href"] if link_el else ""
                 if href and not href.startswith("http"):
@@ -441,7 +453,7 @@ def _parse_search_results(html: str, doc_code: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Fallback: requests + BeautifulSoup for static portal pages
+# Fallback: requests + BeautifulSoup
 # ---------------------------------------------------------------------------
 
 def scrape_clerk_requests(
@@ -449,10 +461,6 @@ def scrape_clerk_requests(
     start_date: datetime,
     end_date: datetime,
 ) -> List[Dict]:
-    """
-    Requests-based fallback scraper for Kane County Recorder.
-    Uses __doPostBack form submission pattern common on ASP.NET portals.
-    """
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -464,9 +472,25 @@ def scrape_clerk_requests(
     date_from = start_date.strftime("%m/%d/%Y")
     date_to   = end_date.strftime("%m/%d/%Y")
 
+    # Try to find a working URL first
+    working_url = None
+    for url in [CLERK_SEARCH] + CLERK_ALTERNATES:
+        try:
+            r = session.get(url, timeout=15)
+            if r.status_code < 400:
+                working_url = url
+                log.info("Requests: found working portal at %s", url)
+                break
+        except Exception:
+            pass
+
+    if not working_url:
+        log.warning("Requests: no reachable portal URL found")
+        return []
+
     for doc_code in doc_codes:
         try:
-            recs = _requests_search_doc(session, doc_code, date_from, date_to)
+            recs = _requests_search_doc(session, doc_code, date_from, date_to, working_url)
             log.info("  %s (requests) → %d records", doc_code, len(recs))
             records.extend(recs)
         except Exception:
@@ -480,23 +504,19 @@ def _requests_search_doc(
     doc_code: str,
     date_from: str,
     date_to: str,
+    search_url: str,
 ) -> List[Dict]:
-    """POST to the recorder search portal for a single doc type."""
-
     def get_page():
-        r = session.get(CLERK_SEARCH, timeout=30)
+        r = session.get(search_url, timeout=30)
         r.raise_for_status()
         return r
 
     resp = retry(get_page)
     soup = BeautifulSoup(resp.text, "lxml")
-
-    # Extract ASP.NET ViewState
     viewstate     = _val(soup, "__VIEWSTATE")
     eventval      = _val(soup, "__EVENTVALIDATION")
     viewstategen  = _val(soup, "__VIEWSTATEGENERATOR")
 
-    # Build POST payload – field names may vary; these are common patterns
     payload = {
         "__VIEWSTATE":          viewstate,
         "__EVENTVALIDATION":    eventval,
@@ -510,17 +530,15 @@ def _requests_search_doc(
     }
 
     def do_post():
-        r = session.post(CLERK_SEARCH, data=payload, timeout=30)
+        r = session.post(search_url, data=payload, timeout=30)
         r.raise_for_status()
         return r
 
     try:
         resp2 = retry(do_post)
-        records = _parse_search_results(resp2.text, doc_code)
+        return _parse_search_results(resp2.text, doc_code)
     except Exception:
-        records = []
-
-    return records
+        return []
 
 
 def _val(soup, field_name: str) -> str:
@@ -533,58 +551,44 @@ def _val(soup, field_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def compute_score(record: Dict) -> Tuple[int, List[str]]:
-    """
-    Compute a motivated-seller score (0-100) and flag list.
-    Base: 30 pts; each flag: +10; LP+FC combo: +20; high amount bonus; etc.
-    """
     score = 30
     flags: List[str] = list(record.get("_base_flags", []))
-    doc_code = record.get("doc_code", "")
-    amount   = record.get("amount", 0.0)
-    filed    = record.get("filed", "")
-    owner    = record.get("grantor", "")
+    amount = record.get("amount", 0.0)
+    owner  = record.get("grantor", "")
+    filed  = record.get("filed", "")
 
-    # Flag: LLC / Corp owner
     if re.search(r"\b(LLC|INC|CORP|L\.L\.C|CO\.|COMPANY|TRUST)\b", (owner or "").upper()):
         if "LLC / corp owner" not in flags:
             flags.append("LLC / corp owner")
 
-    # Flag: New this week (filed within 7 days)
     try:
         filed_dt = datetime.strptime(re.sub(r"\s+", " ", filed.strip()), "%m/%d/%Y")
-        cutoff = datetime.now() - timedelta(days=7)
-        if filed_dt >= cutoff:
+        if filed_dt >= datetime.now() - timedelta(days=7):
             flags.append("New this week")
     except Exception:
         pass
 
-    # Flag: has property address
     has_addr = bool(record.get("prop_address"))
 
-    # Score additions
-    seen_flags = set(flags)
-    score += 10 * len(seen_flags)
+    seen = set(flags)
+    score += 10 * len(seen)
 
-    # LP + Foreclosure combo
-    all_flags_set = {f.lower() for f in seen_flags}
-    if "lis pendens" in all_flags_set and "pre-foreclosure" in all_flags_set:
+    all_flags_lower = {f.lower() for f in seen}
+    if "lis pendens" in all_flags_lower and "pre-foreclosure" in all_flags_lower:
         score += 20
 
-    # Amount bonuses
     if amount > 100_000:
         score += 15
     elif amount > 50_000:
         score += 10
 
-    # New this week
-    if "new this week" in {f.lower() for f in seen_flags}:
+    if "new this week" in all_flags_lower:
         score += 5
 
-    # Has address
     if has_addr:
         score += 5
 
-    return min(score, 100), flags
+    return min(score, 100), list(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -594,78 +598,70 @@ def compute_score(record: Dict) -> Tuple[int, List[str]]:
 def build_records(
     raw: List[Dict], parcel: ParcelLookup, run_dt: datetime
 ) -> List[Dict]:
-    """Enrich raw scraper records with parcel data, scoring, etc."""
     output: List[Dict] = []
     cutoff = run_dt - timedelta(days=LOOK_BACK_DAYS)
 
     for raw_rec in raw:
         try:
             doc_code = raw_rec.get("doc_code", "")
-            cat_info = DOC_TYPE_MAP.get(doc_code, ("other", doc_code, []))
-            cat, cat_label, base_flags = cat_info
-
-            # Filter by date
+            cat, cat_label, base_flags = DOC_TYPE_MAP.get(
+                doc_code, ("other", doc_code, [])
+            )
             filed_str = raw_rec.get("filed", "")
             try:
-                filed_dt = datetime.strptime(re.sub(r"\s+", " ", filed_str.strip()), "%m/%d/%Y")
+                filed_dt = datetime.strptime(
+                    re.sub(r"\s+", " ", filed_str.strip()), "%m/%d/%Y"
+                )
                 if filed_dt < cutoff:
                     continue
             except Exception:
-                pass  # Keep records with unparseable dates
+                pass
 
             raw_rec["_base_flags"] = base_flags[:]
             owner = raw_rec.get("grantor", "")
 
-            # Parcel lookup
             parcel_rec = parcel.lookup(owner)
-            prop_addr  = ""
-            prop_city  = ""
+            prop_addr = prop_city = prop_zip = ""
+            mail_addr = mail_city = mail_state = mail_zip = ""
             prop_state = "IL"
-            prop_zip   = ""
-            mail_addr  = ""
-            mail_city  = ""
-            mail_state = ""
-            mail_zip   = ""
 
             if parcel_rec:
                 prop_addr  = parcel_rec.get("site_addr", "")
                 prop_city  = parcel_rec.get("site_city", "")
-                prop_zip   = parcel_rec.get("site_zip", "")
+                prop_zip   = parcel_rec.get("site_zip",  "")
                 mail_addr  = parcel_rec.get("mail_addr", "")
                 mail_city  = parcel_rec.get("mail_city", "")
                 mail_state = parcel_rec.get("mail_state", "IL")
-                mail_zip   = parcel_rec.get("mail_zip", "")
+                mail_zip   = parcel_rec.get("mail_zip",  "")
 
             rec: Dict[str, Any] = {
-                "doc_num":     raw_rec.get("doc_num", ""),
-                "doc_type":    doc_code,
-                "filed":       filed_str,
-                "cat":         cat,
-                "cat_label":   cat_label,
-                "owner":       owner,
-                "grantee":     raw_rec.get("grantee", ""),
-                "amount":      raw_rec.get("amount", 0.0),
-                "legal":       raw_rec.get("legal", ""),
-                "prop_address":prop_addr,
-                "prop_city":   prop_city,
-                "prop_state":  prop_state,
-                "prop_zip":    prop_zip,
-                "mail_address":mail_addr,
-                "mail_city":   mail_city,
-                "mail_state":  mail_state,
-                "mail_zip":    mail_zip,
-                "clerk_url":   raw_rec.get("clerk_url", CLERK_SEARCH),
-                "flags":       [],
-                "score":       0,
+                "doc_num":      raw_rec.get("doc_num", ""),
+                "doc_type":     doc_code,
+                "filed":        filed_str,
+                "cat":          cat,
+                "cat_label":    cat_label,
+                "owner":        owner,
+                "grantee":      raw_rec.get("grantee", ""),
+                "amount":       raw_rec.get("amount", 0.0),
+                "legal":        raw_rec.get("legal", ""),
+                "prop_address": prop_addr,
+                "prop_city":    prop_city,
+                "prop_state":   prop_state,
+                "prop_zip":     prop_zip,
+                "mail_address": mail_addr,
+                "mail_city":    mail_city,
+                "mail_state":   mail_state,
+                "mail_zip":     mail_zip,
+                "clerk_url":    raw_rec.get("clerk_url", CLERK_SEARCH),
+                "flags":        [],
+                "score":        0,
             }
-
             score, flags = compute_score({**raw_rec, **rec})
             rec["score"] = score
             rec["flags"] = flags
-
             output.append(rec)
         except Exception:
-            log.error("Error building record: %s", traceback.format_exc())
+            log.error("Error building record:\n%s", traceback.format_exc())
 
     return output
 
@@ -675,7 +671,6 @@ def build_records(
 # ---------------------------------------------------------------------------
 
 def export_ghl_csv(records: List[Dict], path: Path):
-    """Export records to a GoHighLevel-compatible CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = [
         "First Name", "Last Name",
@@ -690,10 +685,9 @@ def export_ghl_csv(records: List[Dict], path: Path):
         writer.writeheader()
         for rec in records:
             owner = rec.get("owner", "")
-            # Try to split owner into First/Last
-            name_parts = owner.replace(",", " ").split()
-            first = name_parts[0] if name_parts else ""
-            last  = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+            parts = owner.replace(",", " ").split()
+            first = parts[0] if parts else ""
+            last  = " ".join(parts[1:]) if len(parts) > 1 else ""
             writer.writerow({
                 "First Name":            first,
                 "Last Name":             last,
@@ -723,18 +717,17 @@ def export_ghl_csv(records: List[Dict], path: Path):
 # ---------------------------------------------------------------------------
 
 def write_output(records: List[Dict], run_dt: datetime):
-    """Write dashboard/records.json and data/records.json."""
     start_dt = run_dt - timedelta(days=LOOK_BACK_DAYS)
     payload = {
-        "fetched_at":    run_dt.isoformat(),
-        "source":        "Kane County Recorder",
-        "date_range":    {
+        "fetched_at":   run_dt.isoformat(),
+        "source":       "Kane County Recorder",
+        "date_range":   {
             "from": start_dt.strftime("%Y-%m-%d"),
             "to":   run_dt.strftime("%Y-%m-%d"),
         },
-        "total":         len(records),
-        "with_address":  sum(1 for r in records if r.get("prop_address")),
-        "records":       records,
+        "total":        len(records),
+        "with_address": sum(1 for r in records if r.get("prop_address")),
+        "records":      records,
     }
     for dir_name in ["dashboard", "data"]:
         p = Path(dir_name)
@@ -742,12 +735,11 @@ def write_output(records: List[Dict], run_dt: datetime):
         out = p / "records.json"
         out.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         log.info("Wrote %s (%d records)", out, len(records))
-    # GHL CSV
     export_ghl_csv(records, Path("data/ghl_export.csv"))
 
 
 # ---------------------------------------------------------------------------
-# Main Orchestrator
+# Main
 # ---------------------------------------------------------------------------
 
 async def main():
@@ -759,33 +751,21 @@ async def main():
     log.info("Date range: %s → %s", start_dt.date(), end_dt.date())
     log.info("Doc types: %s", ALL_DOC_CODES)
 
-    # 1. Load parcel data
     parcel = ParcelLookup()
     parcel.load()
 
-    # 2. Scrape clerk portal via Playwright
     raw_records: List[Dict] = []
     try:
         log.info("Starting Playwright scrape …")
-        raw_records = await scrape_clerk_playwright(
-            ALL_DOC_CODES, start_dt, end_dt
-        )
+        raw_records = await scrape_clerk_playwright(ALL_DOC_CODES, start_dt, end_dt)
     except Exception:
         log.error("Playwright failed, falling back to requests:\n%s", traceback.format_exc())
-        raw_records = scrape_clerk_requests(
-            ALL_DOC_CODES, start_dt, end_dt
-        )
+        raw_records = scrape_clerk_requests(ALL_DOC_CODES, start_dt, end_dt)
 
     log.info("Raw records scraped: %d", len(raw_records))
-
-    # 3. Enrich + score
     records = build_records(raw_records, parcel, run_dt)
     log.info("Enriched records: %d", len(records))
-
-    # 4. Sort by score descending
     records.sort(key=lambda r: r.get("score", 0), reverse=True)
-
-    # 5. Write output
     write_output(records, run_dt)
     log.info("Done.")
 
