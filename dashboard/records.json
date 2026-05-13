@@ -1,9 +1,9 @@
 {
-  "fetched_at": "2026-05-12T13:31:32.383558",
+  "fetched_at": "2026-05-13T16:12:36.908772",
   "source": "Kane County Recorder",
   "date_range": {
-    "from": "2026-05-05",
-    "to": "2026-05-12"
+    "from": "2026-05-06",
+    "to": "2026-05-13"
   },
   "total": 0,
   "with_address": 0,
